@@ -26,6 +26,204 @@ DEFAULT_MAX_TIME = 5.0
 logger = logging.getLogger(__name__)
 
 #################################################################
+# Constrained Maximum Spanning Arborescence (Chu-Liu-Edmonds)
+#################################################################
+
+
+class InfeasibleConstraintsError(ValueError):
+    """
+    Raised by :meth:`ProbabilisticNonprojectiveParser.parse` when the
+    ``required_arcs``/``forbidden_arcs`` constraints, or the
+    single-root condition, cannot be satisfied.  The ``problems``
+    attribute lists human-readable explanations.
+    """
+
+    def __init__(self, problems):
+        self.problems = list(problems)
+        super().__init__("infeasible arc constraints: " + "; ".join(self.problems))
+
+
+class ConstrainedParseResult:
+    """
+    The outcome of :meth:`ProbabilisticNonprojectiveParser.parse_constrained`.
+
+    ``feasible`` reports whether a legal analysis exists.  When it does,
+    ``graph`` holds the highest-scoring legal ``DependencyGraph`` and
+    ``score`` its total arc score.  When it does not, ``problems``
+    lists human-readable explanations of why no legal analysis exists
+    (conflicting required arcs, required arcs forming a cycle, a token
+    with no available incoming arc, or an unsatisfiable single-root
+    condition).
+    """
+
+    def __init__(self, feasible, graph=None, score=None, problems=()):
+        self.feasible = feasible
+        self.graph = graph
+        self.score = score
+        self.problems = list(problems)
+
+    def __bool__(self):
+        return self.feasible
+
+    def __repr__(self):
+        if self.feasible:
+            return f"<ConstrainedParseResult feasible score={self.score}>"
+        return f"<ConstrainedParseResult infeasible: {'; '.join(self.problems)}>"
+
+
+def _node_sort_key(node):
+    """
+    Deterministic ordering key for node identifiers.  Cycle contraction
+    represents supernodes as frozensets, so a type-aware key is needed to
+    keep tie-breaking stable.
+    """
+    if isinstance(node, frozenset):
+        return (1, tuple(sorted(_node_sort_key(member) for member in node)))
+    return (0, node)
+
+
+def _find_cycle(best, root):
+    """
+    Return a cycle in the parent map ``best`` as a list of node
+    identifiers, or ``None`` if the map is acyclic.  Nodes without an
+    entry in ``best``, and the ``root``, terminate the search.
+    """
+    color = {}
+    for start in best:
+        if color.get(start, 0) != 0:
+            continue
+        path = []
+        node = start
+        while node is not None and node != root and color.get(node, 0) == 0:
+            color[node] = 1
+            path.append(node)
+            node = best.get(node)
+        if node is not None and node != root and color.get(node) == 1:
+            return path[path.index(node) :]
+        for member in path:
+            color[member] = 2
+    return None
+
+
+def _canonical_cycle(cycle):
+    """Rotate a cycle so it starts at its smallest member (stable printing)."""
+    start = cycle.index(min(cycle))
+    return cycle[start:] + cycle[:start]
+
+
+def _max_arborescence(node_ids, root, weights):
+    """
+    Chu-Liu-Edmonds maximum spanning arborescence.
+
+    :param node_ids: node identifiers; cycle contraction represents
+        supernodes as frozensets of their members.
+    :param root: the designated root; it receives no incoming arc.
+    :param weights: dict mapping ``(head, dependent)`` to a numeric score.
+        Only arcs present in the dict are allowed, so forbidden arcs are
+        simply omitted.  Scores may be negative.
+    :return: a dict mapping every non-root node to its head, or ``None``
+        when no spanning arborescence exists.  Ties are broken
+        deterministically towards the smallest head, then the smallest
+        dependent, so equal-scoring inputs always yield the same tree.
+    """
+    incoming = {}
+    for (head, dep), weight in weights.items():
+        incoming.setdefault(dep, []).append((head, weight))
+
+    best = {}
+    for dep in node_ids:
+        if dep == root:
+            continue
+        candidates = incoming.get(dep)
+        if not candidates:
+            return None
+        best[dep] = min(
+            candidates,
+            key=lambda candidate: (-candidate[1], _node_sort_key(candidate[0])),
+        )[0]
+
+    cycle = _find_cycle(best, root)
+    if cycle is None:
+        return best
+
+    # Contract the cycle into a supernode and recurse.  Arcs entering the
+    # cycle are discounted by the greedy in-arc they would replace; arcs
+    # leaving the cycle keep their weight.  The required-arc bonus (if
+    # any) travels with each arc, so fixed arcs stay fixed through
+    # contraction and expansion.
+    cycle_members = frozenset(cycle)
+    supernode = cycle_members
+    contracted_nodes = [node for node in node_ids if node not in cycle_members]
+    contracted_nodes.append(supernode)
+
+    contracted_weights = {}
+    origin = {}
+    for (head, dep), weight in weights.items():
+        head_in = head in cycle_members
+        dep_in = dep in cycle_members
+        if head_in and dep_in:
+            continue
+        if not head_in and not dep_in:
+            new_edge, new_weight, new_origin = (head, dep), weight, (head, dep)
+        elif dep_in:
+            new_edge = (head, supernode)
+            new_weight = weight - weights[(best[dep], dep)]
+            new_origin = (head, dep)
+        else:
+            new_edge = (supernode, dep)
+            new_weight = weight
+            new_origin = (head, dep)
+        key = (
+            -new_weight,
+            _node_sort_key(new_origin[0]),
+            _node_sort_key(new_origin[1]),
+        )
+        if new_edge not in contracted_weights or key < contracted_weights[new_edge][0]:
+            contracted_weights[new_edge] = (key, new_weight)
+            origin[new_edge] = new_origin
+
+    sub = _max_arborescence(
+        contracted_nodes,
+        root,
+        {edge: weight for edge, (key, weight) in contracted_weights.items()},
+    )
+    if sub is None:
+        return None
+
+    # Expand the supernode: the arc entering the cycle replaces the greedy
+    # in-arc of the member it lands on; every other member keeps its
+    # greedy head.
+    parents = {}
+    entered = set()
+    for dep, head in sub.items():
+        origin_head, origin_dep = origin[(head, dep)]
+        parents[origin_dep] = origin_head
+        if origin_dep in cycle_members and origin_head not in cycle_members:
+            entered.add(origin_dep)
+    for member in cycle_members:
+        if member not in entered:
+            parents[member] = best[member]
+    return parents
+
+
+def _arc_weights(scores):
+    """
+    Flatten a 3-dimensional ``DependencyScorerI`` score matrix into a
+    dict mapping ``(head, dependent)`` to a single weight.  Cells may
+    hold several alternative scores (as in k-best parsing); the best one
+    is used.  Empty cells mean the arc is not a candidate.  Self-loops
+    and arcs into the virtual root (column 0) are never candidates.
+    """
+    weights = {}
+    for head, row in enumerate(scores):
+        for dep, cell in enumerate(row):
+            if dep == 0 or head == dep or not cell:
+                continue
+            weights[(head, dep)] = max(cell)
+    return weights
+
+
+#################################################################
 # DependencyScorerI - Interface for Graph-Edge Weight Calculation
 #################################################################
 
@@ -445,7 +643,199 @@ class ProbabilisticNonprojectiveParser:
                     max_orig = col_index
         return [max_arc, max_orig]
 
-    def parse(self, tokens, tags):
+    def parse_constrained(self, tokens, tags, required_arcs=None, forbidden_arcs=None):
+        """
+        Find the highest-scoring non-projective parse that respects the
+        given hard arc constraints.  The constraints are folded into the
+        Chu-Liu-Edmonds maximum spanning arborescence search itself --
+        replacing arcs in an unconstrained MST afterwards would break
+        both acyclicity and optimality.
+
+        The virtual root has address 0 and ``tokens[i]`` has address
+        ``i + 1``; arcs are ``(head, dependent)`` address pairs.
+        Exactly one token is attached to the virtual root in every
+        returned parse.  Negative scores are supported.  Ties are broken
+        deterministically: the smallest-address root child is preferred,
+        and equal-scoring arcs are resolved towards the smallest head,
+        then the smallest dependent.
+
+        :type tokens: list(str)
+        :param tokens: A list of words or punctuation to be parsed.
+        :type tags: list(str)
+        :param tags: A list of tags corresponding by index to the words
+            in the tokens list.
+        :param required_arcs: arcs that must appear in the parse.
+        :type required_arcs: iter(tuple(int, int)) or None
+        :param forbidden_arcs: arcs that must not appear in the parse.
+        :type forbidden_arcs: iter(tuple(int, int)) or None
+        :return: The parse outcome.  When no legal analysis exists, its
+            ``problems`` explain why (conflicting required arcs,
+            required arcs forming a cycle, a token with no available
+            incoming arc, or an unsatisfiable single-root condition).
+        :rtype: ConstrainedParseResult
+
+        >>> class Scorer(DependencyScorerI):
+        ...     def train(self, graphs):
+        ...         pass
+        ...     def score(self, graph):
+        ...         return [
+        ...             [[], [5],  [1],  [1]],
+        ...             [[], [],   [11], [4]],
+        ...             [[], [10], [],   [5]],
+        ...             [[], [8],  [8],  []],
+        ...         ]
+        >>> npp = ProbabilisticNonprojectiveParser()
+        >>> npp.train([], Scorer())
+        >>> result = npp.parse_constrained(['v1', 'v2', 'v3'], [None, None, None])
+        >>> result.feasible
+        True
+        >>> result.score
+        21
+        >>> result.graph.root["word"]
+        'v1'
+
+        >>> result = npp.parse_constrained(['v1', 'v2', 'v3'], [None, None, None],
+        ...                                required_arcs=[(3, 2)],
+        ...                                forbidden_arcs=[(1, 2)])
+        >>> result.feasible, result.score
+        (True, 19)
+
+        >>> result = npp.parse_constrained(['v1', 'v2', 'v3'], [None, None, None],
+        ...                                required_arcs=[(1, 2), (2, 1)])
+        >>> result.feasible
+        False
+        >>> result.problems
+        ['the required arcs form a cycle: 1 -> 2 -> 1']
+        """
+        tokens = list(tokens)
+        n = len(tokens)
+        required = {tuple(arc) for arc in (required_arcs or ())}
+        forbidden = {tuple(arc) for arc in (forbidden_arcs or ())}
+
+        graph = DependencyGraph()
+        for index, token in enumerate(tokens):
+            graph.nodes[index + 1].update(
+                {"word": token, "tag": tags[index], "rel": "NTOP", "address": index + 1}
+            )
+        self.initialize_edge_scores(graph)
+        weights = _arc_weights(self.scores)
+
+        problems = []
+        for head, dep in sorted(required):
+            if not (0 <= head <= n and 1 <= dep <= n):
+                problems.append(
+                    f"required arc {(head, dep)} is out of range "
+                    f"for a {n}-token input"
+                )
+            elif head == dep:
+                problems.append(f"required arc {(head, dep)} is a self-loop")
+        # Forbidding an arc that could never be chosen is harmless.
+        forbidden = {
+            (head, dep)
+            for (head, dep) in forbidden
+            if 0 <= head <= n and 1 <= dep <= n and head != dep
+        }
+        for arc in sorted(required & forbidden):
+            problems.append(f"arc {arc} is both required and forbidden")
+        required_head = {}
+        for head, dep in sorted(required):
+            if dep in required_head:
+                problems.append(
+                    f"token {dep} has conflicting required heads: "
+                    f"{required_head[dep]} and {head}"
+                )
+            else:
+                required_head[dep] = head
+        cycle = _find_cycle(required_head, root=0)
+        if cycle is not None:
+            cycle = _canonical_cycle(cycle)
+            problems.append(
+                "the required arcs form a cycle: "
+                + " -> ".join(str(node) for node in cycle + [cycle[0]])
+            )
+        for head, dep in sorted(required):
+            if 0 <= head <= n and 1 <= dep <= n and head != dep:
+                if (head, dep) not in weights:
+                    problems.append(
+                        f"required arc {(head, dep)} is not a candidate arc "
+                        "(the scorer gave it no score)"
+                    )
+        if problems:
+            return ConstrainedParseResult(False, problems=problems)
+
+        allowed = {
+            arc: weight for arc, weight in weights.items() if arc not in forbidden
+        }
+        for dep in range(1, n + 1):
+            if dep in required_head:
+                continue
+            if not any(arc_dep == dep for (arc_head, arc_dep) in allowed):
+                problems.append(f"token {dep} has no available incoming arc")
+        root_required = [dep for (head, dep) in sorted(required) if head == 0]
+        if len(root_required) > 1:
+            problems.append(
+                "the single-root condition is unsatisfiable: tokens "
+                f"{root_required} are all required to attach to the virtual root"
+            )
+        if not problems and n > 0:
+            if root_required:
+                root_candidates = root_required
+            else:
+                root_candidates = [
+                    dep
+                    for (head, dep) in sorted(allowed)
+                    if head == 0 and dep not in required_head
+                ]
+            if not root_candidates:
+                problems.append(
+                    "the single-root condition is unsatisfiable: "
+                    "no token can be attached to the virtual root"
+                )
+        if problems:
+            return ConstrainedParseResult(False, problems=problems)
+        if n == 0:
+            return ConstrainedParseResult(True, graph=graph, score=0)
+
+        # Fold the required arcs into the search with a bonus that
+        # dominates every possible total score; the maximum arborescence
+        # then contains all required arcs whenever some legal tree does.
+        bonus = sum(abs(weight) for weight in allowed.values()) + 1
+        best = None
+        for root_child in root_candidates:
+            # Exactly one root arc: only the candidate may attach to the
+            # virtual root in this run.
+            run_weights = {
+                arc: weight
+                for arc, weight in allowed.items()
+                if arc[0] != 0 or arc[1] == root_child
+            }
+            for arc in required:
+                run_weights[arc] += bonus
+            parents = _max_arborescence(list(range(n + 1)), 0, run_weights)
+            if parents is None:
+                continue
+            arcs = {(head, dep) for dep, head in parents.items()}
+            if not required <= arcs:
+                continue
+            score = sum(allowed[arc] for arc in arcs)
+            if best is None or score > best[0]:
+                best = (score, root_child, parents)
+        if best is None:
+            return ConstrainedParseResult(
+                False,
+                problems=[
+                    "no legal analysis satisfies the constraints: the required "
+                    "arcs cannot be extended to a single-rooted spanning tree"
+                ],
+            )
+
+        score, root_child, parents = best
+        for dep in range(1, n + 1):
+            graph.add_arc(parents[dep], dep)
+        graph.root = graph.nodes[root_child]
+        return ConstrainedParseResult(True, graph=graph, score=score)
+
+    def parse(self, tokens, tags, required_arcs=None, forbidden_arcs=None):
         """
         Parses a list of tokens in accordance to the MST parsing algorithm
         for non-projective dependency parses.  Assumes that the tokens to
@@ -457,111 +847,20 @@ class ProbabilisticNonprojectiveParser:
         :param tokens: A list of words or punctuation to be parsed.
         :type tags: list(str)
         :param tags: A list of tags corresponding by index to the words in the tokens list.
+        :param required_arcs: optional arcs that must appear in the parse;
+            see :meth:`parse_constrained`.
+        :param forbidden_arcs: optional arcs that must not appear in the
+            parse; see :meth:`parse_constrained`.
         :return: An iterator of non-projective parses.
         :rtype: iter(DependencyGraph)
+        :raises InfeasibleConstraintsError: if the arc constraints or the
+            single-root condition cannot be satisfied; the exception's
+            ``problems`` attribute explains why.
         """
-        self.inner_nodes = {}
-
-        # Initialize g_graph
-        g_graph = DependencyGraph()
-        for index, token in enumerate(tokens):
-            g_graph.nodes[index + 1].update(
-                {"word": token, "tag": tags[index], "rel": "NTOP", "address": index + 1}
-            )
-
-        # Fully connect non-root nodes in g_graph
-        g_graph.connect_graph()
-        original_graph = DependencyGraph()
-        for index, token in enumerate(tokens):
-            original_graph.nodes[index + 1].update(
-                {"word": token, "tag": tags[index], "rel": "NTOP", "address": index + 1}
-            )
-
-        b_graph = DependencyGraph()
-        c_graph = DependencyGraph()
-
-        for index, token in enumerate(tokens):
-            c_graph.nodes[index + 1].update(
-                {"word": token, "tag": tags[index], "rel": "NTOP", "address": index + 1}
-            )
-
-        # Assign initial scores to g_graph edges
-        self.initialize_edge_scores(g_graph)
-        logger.debug(self.scores)
-        # Initialize a list of unvisited vertices (by node address)
-        unvisited_vertices = [vertex["address"] for vertex in c_graph.nodes.values()]
-        # Iterate over unvisited vertices
-        nr_vertices = len(tokens)
-        betas = {}
-        while unvisited_vertices:
-            # Mark current node as visited
-            current_vertex = unvisited_vertices.pop(0)
-            logger.debug("current_vertex: %s", current_vertex)
-            # Get corresponding node n_i to vertex v_i
-            current_node = g_graph.get_by_address(current_vertex)
-            logger.debug("current_node: %s", current_node)
-            # Get best in-edge node b for current node
-            best_in_edge = self.best_incoming_arc(current_vertex)
-            betas[current_vertex] = self.original_best_arc(current_vertex)
-            logger.debug("best in arc: %s --> %s", best_in_edge, current_vertex)
-            # b_graph = Union(b_graph, b)
-            for new_vertex in [current_vertex, best_in_edge]:
-                b_graph.nodes[new_vertex].update(
-                    {"word": "TEMP", "rel": "NTOP", "address": new_vertex}
-                )
-            b_graph.add_arc(best_in_edge, current_vertex)
-            # Beta(current node) = b  - stored for parse recovery
-            # If b_graph contains a cycle, collapse it
-            cycle_path = b_graph.contains_cycle()
-            if cycle_path:
-                # Create a new node v_n+1 with address = len(nodes) + 1
-                new_node = {"word": "NONE", "rel": "NTOP", "address": nr_vertices + 1}
-                # c_graph = Union(c_graph, v_n+1)
-                c_graph.add_node(new_node)
-                # Collapse all nodes in cycle C into v_n+1
-                self.update_edge_scores(new_node, cycle_path)
-                self.collapse_nodes(new_node, cycle_path, g_graph, b_graph, c_graph)
-                for cycle_index in cycle_path:
-                    c_graph.add_arc(new_node["address"], cycle_index)
-                    # self.replaced_by[cycle_index] = new_node['address']
-
-                self.inner_nodes[new_node["address"]] = cycle_path
-
-                # Add v_n+1 to list of unvisited vertices
-                unvisited_vertices.insert(0, nr_vertices + 1)
-
-                # increment # of nodes counter
-                nr_vertices += 1
-
-                # Remove cycle nodes from b_graph; B = B - cycle c
-                for cycle_node_address in cycle_path:
-                    b_graph.remove_by_address(cycle_node_address)
-
-            logger.debug("g_graph: %s", g_graph)
-            logger.debug("b_graph: %s", b_graph)
-            logger.debug("c_graph: %s", c_graph)
-            logger.debug("Betas: %s", betas)
-            logger.debug("replaced nodes %s", self.inner_nodes)
-
-        # Recover parse tree
-        logger.debug("Final scores: %s", self.scores)
-
-        logger.debug("Recovering parse...")
-        for i in range(len(tokens) + 1, nr_vertices + 1):
-            betas[betas[i][1]] = betas[i]
-
-        logger.debug("Betas: %s", betas)
-        for node in original_graph.nodes.values():
-            # TODO: It's dangerous to assume that deps it a dictionary
-            # because it's a default dictionary. Ideally, here we should not
-            # be concerned how dependencies are stored inside of a dependency
-            # graph.
-            node["deps"] = {}
-        for i in range(1, len(tokens) + 1):
-            original_graph.add_arc(betas[i][0], betas[i][1])
-
-        logger.debug("Done.")
-        yield original_graph
+        result = self.parse_constrained(tokens, tags, required_arcs, forbidden_arcs)
+        if not result.feasible:
+            raise InfeasibleConstraintsError(result.problems)
+        yield result.graph
 
 
 #################################################################

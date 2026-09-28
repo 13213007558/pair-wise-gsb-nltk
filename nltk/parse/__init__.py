@@ -77,6 +77,8 @@ from nltk.parse.featurechart import (
 )
 from nltk.parse.malt import MaltParser
 from nltk.parse.nonprojectivedependencyparser import (
+    ConstrainedParseResult,
+    InfeasibleConstraintsError,
     NaiveBayesDependencyScorer,
     NonprojectiveDependencyParser,
     ProbabilisticNonprojectiveParser,
