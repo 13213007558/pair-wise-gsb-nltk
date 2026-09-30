@@ -7,11 +7,14 @@
 # For license information, see LICENSE.TXT
 
 """BLEU score implementation."""
+
 import math
+import random
 import sys
 import warnings
 from collections import Counter
 from fractions import Fraction as _Fraction
+from typing import NamedTuple
 
 from nltk.util import ngrams
 
@@ -712,3 +715,251 @@ class SmoothingFunction:
         p_n = self.method4(p_n, references, hypothesis, hyp_len)
         p_n = self.method5(p_n, references, hypothesis, hyp_len)
         return p_n
+
+
+class PairedBootstrapResult(NamedTuple):
+    """
+    Result of :func:`paired_bootstrap_bleu`.
+
+    :field bleu_a: corpus BLEU of system A on the full corpus (point estimate).
+    :field bleu_b: corpus BLEU of system B on the full corpus (point estimate).
+    :field difference: point estimate of the score difference, ``bleu_a - bleu_b``.
+    :field ci_low: lower bound of the percentile confidence interval of the difference.
+    :field ci_high: upper bound of the percentile confidence interval of the difference.
+    :field confidence: the confidence level used for the interval.
+    :field n_resamples: number of bootstrap resamples that were drawn.
+    :field n_valid: number of resamples that produced a finite score for both
+        systems and were used for the interval (the effective resample count).
+    :field differences: per-resample score differences (A - B), in draw order.
+    :field scores_a: per-resample corpus BLEU of system A, in draw order.
+    :field scores_b: per-resample corpus BLEU of system B, in draw order.
+    :field sample_indices: the sampling-unit indices drawn for each resample.
+    """
+
+    bleu_a: float
+    bleu_b: float
+    difference: float
+    ci_low: float
+    ci_high: float
+    confidence: float
+    n_resamples: int
+    n_valid: int
+    differences: list
+    scores_a: list
+    scores_b: list
+    sample_indices: list
+
+
+def _percentile(sorted_values, q):
+    """
+    Linear-interpolation percentile of an already sorted sequence.
+
+    :param sorted_values: sorted list of floats.
+    :param q: quantile in [0, 1].
+    """
+    if not sorted_values:
+        raise ValueError("Cannot compute a percentile of an empty sequence.")
+    pos = (len(sorted_values) - 1) * q
+    lower = math.floor(pos)
+    upper = math.ceil(pos)
+    if lower == upper:
+        return sorted_values[lower]
+    return sorted_values[lower] * (upper - pos) + sorted_values[upper] * (pos - lower)
+
+
+def paired_bootstrap_bleu(
+    list_of_references,
+    hypotheses_a,
+    hypotheses_b,
+    weights=(0.25, 0.25, 0.25, 0.25),
+    smoothing_function=None,
+    auto_reweigh=False,
+    document_ids=None,
+    n_resamples=1000,
+    confidence=0.95,
+    seed=None,
+    sample_indices=None,
+):
+    """
+    Paired bootstrap comparison of two MT systems with corpus BLEU.
+
+    Following Koehn (2004) "Statistical Significance Tests for Machine
+    Translation Evaluation" (EMNLP), the corpus is resampled with replacement
+    and both systems are scored on *the same* resampled corpus in every
+    replicate, so the per-replicate differences are paired. Each replicate
+    recomputes the clipped n-gram counts and the brevity penalty from scratch
+    via :func:`corpus_bleu` (micro-average); sentence BLEU scores are never
+    averaged.
+
+    Sentences may be grouped into documents via ``document_ids``; a document
+    is then the sampling unit, i.e. all of its sentences enter or leave a
+    resample together. Without ``document_ids`` each sentence is its own
+    sampling unit.
+
+    Multiple references per sentence, short sentences, empty hypotheses and
+    the smoothing functions behave exactly as in :func:`corpus_bleu`.
+
+    >>> refs = [
+    ...     ['the cat is on the mat'.split()],
+    ...     ['the dog is in the garden'.split()],
+    ...     ['she reads a good book'.split()],
+    ...     ['we play football in the park'.split()],
+    ... ]
+    >>> hyp_a = [
+    ...     'the cat is on the mat'.split(),
+    ...     'the dog is in the garden'.split(),
+    ...     'she reads a good book'.split(),
+    ...     'we play football in the park'.split(),
+    ... ]
+    >>> hyp_b = [
+    ...     'the cat is on mat'.split(),
+    ...     'the dog is in garden'.split(),
+    ...     'she read a good book'.split(),
+    ...     'we play football in park'.split(),
+    ... ]
+    >>> result = paired_bootstrap_bleu(refs, hyp_a, hyp_b, n_resamples=100, seed=42)
+    >>> result.bleu_a > result.bleu_b
+    True
+    >>> result.difference == result.bleu_a - result.bleu_b
+    True
+    >>> result.n_resamples, result.n_valid
+    (100, 100)
+    >>> result.ci_low <= result.ci_high
+    True
+
+    :param list_of_references: a corpus of lists of reference sentences, w.r.t. hypotheses
+    :type list_of_references: list(list(list(str)))
+    :param hypotheses_a: hypothesis sentences of system A
+    :type hypotheses_a: list(list(str))
+    :param hypotheses_b: hypothesis sentences of system B, aligned with ``hypotheses_a``
+    :type hypotheses_b: list(list(str))
+    :param weights: a single weights tuple for unigrams, bigrams, trigrams and so on
+    :type weights: tuple(float)
+    :param smoothing_function:
+    :type smoothing_function: SmoothingFunction
+    :param auto_reweigh: Option to re-normalize the weights uniformly.
+    :type auto_reweigh: bool
+    :param document_ids: optional document id per sentence; sentences sharing
+        an id form one sampling unit. If None, sample at sentence level.
+    :type document_ids: list
+    :param n_resamples: number of bootstrap replicates to draw (ignored when
+        ``sample_indices`` is given).
+    :type n_resamples: int
+    :param confidence: confidence level for the percentile interval, e.g. 0.95.
+    :type confidence: float
+    :param seed: seed for the random number generator that draws the resamples.
+    :type seed: int
+    :param sample_indices: optional pre-drawn resamples; a list of replicates,
+        each a sequence of sampling-unit indices. Both systems are always
+        evaluated on the same indices.
+    :type sample_indices: list(list(int))
+    :return: point estimates, confidence interval of the difference and the
+        effective number of resamples.
+    :rtype: PairedBootstrapResult
+    """
+    n_sentences = len(list_of_references)
+    if len(hypotheses_a) != n_sentences or len(hypotheses_b) != n_sentences:
+        raise ValueError(
+            "The number of hypotheses of both systems should be the same "
+            "as the number of reference sets."
+        )
+    if n_sentences == 0:
+        raise ValueError("Cannot bootstrap an empty corpus.")
+    if isinstance(weights[0], (list, tuple)):
+        raise ValueError(
+            "paired_bootstrap_bleu accepts a single weights tuple, "
+            "not a list of weights."
+        )
+    if not 0 < confidence < 1:
+        raise ValueError("confidence should be between 0 and 1 (exclusive).")
+
+    # Group sentences into sampling units (documents, or one unit per sentence).
+    if document_ids is None:
+        units = [(i,) for i in range(n_sentences)]
+    else:
+        if len(document_ids) != n_sentences:
+            raise ValueError(
+                "document_ids should provide one document id per sentence."
+            )
+        documents = {}
+        for i, document_id in enumerate(document_ids):
+            documents.setdefault(document_id, []).append(i)
+        units = [tuple(sentence_ids) for sentence_ids in documents.values()]
+
+    # Draw the resamples once; both systems are scored on the same draws.
+    if sample_indices is not None:
+        replicates = [tuple(replicate) for replicate in sample_indices]
+        for replicate in replicates:
+            for unit_index in replicate:
+                if not 0 <= unit_index < len(units):
+                    raise ValueError(
+                        "sample_indices contains an out-of-range "
+                        f"sampling-unit index: {unit_index}"
+                    )
+    else:
+        if n_resamples < 1:
+            raise ValueError("n_resamples should be at least 1.")
+        rng = random.Random(seed)
+        replicates = [
+            tuple(rng.randrange(len(units)) for _ in range(len(units)))
+            for _ in range(n_resamples)
+        ]
+
+    def resampled_corpus_bleu(hypotheses, replicate):
+        sentence_ids = [i for unit_index in replicate for i in units[unit_index]]
+        sub_references = [list_of_references[i] for i in sentence_ids]
+        sub_hypotheses = [hypotheses[i] for i in sentence_ids]
+        return corpus_bleu(
+            sub_references,
+            sub_hypotheses,
+            weights,
+            smoothing_function,
+            auto_reweigh,
+        )
+
+    kept_indices, scores_a, scores_b, differences = [], [], [], []
+    for replicate in replicates:
+        score_a = resampled_corpus_bleu(hypotheses_a, replicate)
+        score_b = resampled_corpus_bleu(hypotheses_b, replicate)
+        # Skip degenerate resamples (e.g. non-finite scores); they do not
+        # count towards the effective number of resamples.
+        if not (math.isfinite(score_a) and math.isfinite(score_b)):
+            continue
+        kept_indices.append(replicate)
+        scores_a.append(score_a)
+        scores_b.append(score_b)
+        differences.append(score_a - score_b)
+
+    n_valid = len(differences)
+    if n_valid == 0:
+        raise ValueError(
+            "No valid resamples: every replicate produced a non-finite BLEU score."
+        )
+
+    # Point estimates on the full (non-resampled) corpus.
+    bleu_a = corpus_bleu(
+        list_of_references, hypotheses_a, weights, smoothing_function, auto_reweigh
+    )
+    bleu_b = corpus_bleu(
+        list_of_references, hypotheses_b, weights, smoothing_function, auto_reweigh
+    )
+
+    alpha = 1.0 - confidence
+    ordered = sorted(differences)
+    ci_low = _percentile(ordered, alpha / 2)
+    ci_high = _percentile(ordered, 1 - alpha / 2)
+
+    return PairedBootstrapResult(
+        bleu_a=bleu_a,
+        bleu_b=bleu_b,
+        difference=bleu_a - bleu_b,
+        ci_low=ci_low,
+        ci_high=ci_high,
+        confidence=confidence,
+        n_resamples=len(replicates),
+        n_valid=n_valid,
+        differences=differences,
+        scores_a=scores_a,
+        scores_b=scores_b,
+        sample_indices=kept_indices,
+    )
