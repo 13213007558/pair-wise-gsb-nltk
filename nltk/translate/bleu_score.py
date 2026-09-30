@@ -8,9 +8,10 @@
 
 """BLEU score implementation."""
 import math
+import random
 import sys
 import warnings
-from collections import Counter
+from collections import Counter, namedtuple
 from fractions import Fraction as _Fraction
 
 from nltk.util import ngrams
@@ -280,6 +281,234 @@ def corpus_bleu(
         s = bp * math.exp(math.fsum(s))
         bleu_scores.append(s)
     return bleu_scores[0] if len(weights) == 1 else bleu_scores
+
+
+#: Result of :func:`paired_bootstrap_bleu`.
+#:
+#: :param bleu_a: corpus BLEU of system A on the full corpus (point estimate)
+#: :param bleu_b: corpus BLEU of system B on the full corpus (point estimate)
+#: :param delta: ``bleu_a - bleu_b``
+#: :param ci_low: lower bound of the bootstrap confidence interval of the delta
+#: :param ci_high: upper bound of the bootstrap confidence interval of the delta
+#: :param n_effective: number of resamples that yielded a valid score pair
+#: :param scores_a: per-resample corpus BLEU of system A
+#: :param scores_b: per-resample corpus BLEU of system B
+#: :param deltas: per-resample differences (``scores_a[i] - scores_b[i]``)
+PairedBootstrapResult = namedtuple(
+    "PairedBootstrapResult",
+    [
+        "bleu_a",
+        "bleu_b",
+        "delta",
+        "ci_low",
+        "ci_high",
+        "n_effective",
+        "scores_a",
+        "scores_b",
+        "deltas",
+    ],
+)
+
+
+def _percentile(sorted_values, q):
+    """
+    Linear-interpolated percentile of an already sorted sequence (q in [0, 1]).
+    """
+    if not sorted_values:
+        raise ValueError("Cannot compute a percentile of an empty sequence.")
+    if len(sorted_values) == 1:
+        return sorted_values[0]
+    pos = (len(sorted_values) - 1) * q
+    lower = int(math.floor(pos))
+    upper = int(math.ceil(pos))
+    if lower == upper:
+        return sorted_values[lower]
+    fraction = pos - lower
+    return sorted_values[lower] * (1 - fraction) + sorted_values[upper] * fraction
+
+
+def paired_bootstrap_bleu(
+    list_of_references,
+    hypotheses_a,
+    hypotheses_b,
+    weights=(0.25, 0.25, 0.25, 0.25),
+    smoothing_function=None,
+    auto_reweigh=False,
+    documents=None,
+    n_resamples=1000,
+    confidence_level=0.95,
+    seed=None,
+    sample_indices=None,
+):
+    """
+    Compare two MT systems with a paired bootstrap test on corpus BLEU.
+
+    Both systems are scored on the *same* resampled corpora: in every
+    resample, the clipped n-gram counts and the brevity penalty are
+    recomputed from the resampled sentences via :func:`corpus_bleu` (i.e.
+    sentence BLEU scores are never averaged). Sentences can be grouped
+    into documents with ``documents`` so that all sentences of a document
+    are resampled together as one sampling unit.
+
+    >>> hyp1 = ('It is a guide to action which ensures that the military '
+    ...         'always obeys the commands of the party').split()
+    >>> ref1a = ('It is a guide to action that ensures that the military '
+    ...          'will forever heed Party commands').split()
+    >>> ref1b = ('It is the guiding principle which guarantees the military '
+    ...          'forces always being under the command of the Party').split()
+    >>> ref1c = ('It is the practical guide for the army always to heed '
+    ...          'the directions of the party').split()
+    >>> hyp2 = ('he read the book because he was interested in world '
+    ...         'history').split()
+    >>> ref2a = ('he was interested in world history because he read the '
+    ...          'book').split()
+
+    >>> list_of_references = [[ref1a, ref1b, ref1c], [ref2a]]
+    >>> system_a = [hyp1, hyp2]
+    >>> system_b = [hyp2, hyp1]
+
+    >>> result = paired_bootstrap_bleu(list_of_references, system_a, system_b,
+    ...                                n_resamples=100, seed=13)
+    >>> result.bleu_a == corpus_bleu(list_of_references, system_a)
+    True
+    >>> result.bleu_b == corpus_bleu(list_of_references, system_b)
+    True
+    >>> result.delta == result.bleu_a - result.bleu_b
+    True
+    >>> result.n_effective
+    100
+    >>> result.ci_low <= result.ci_high
+    True
+
+    :param list_of_references: a corpus of lists of reference sentences,
+        w.r.t. hypotheses
+    :type list_of_references: list(list(list(str)))
+    :param hypotheses_a: hypothesis sentences of the first system
+    :type hypotheses_a: list(list(str))
+    :param hypotheses_b: hypothesis sentences of the second system
+    :type hypotheses_b: list(list(str))
+    :param weights: a single weights tuple for unigrams, bigrams, trigrams
+        and so on
+    :type weights: tuple(float)
+    :param smoothing_function:
+    :type smoothing_function: SmoothingFunction
+    :param auto_reweigh: Option to re-normalize the weights uniformly.
+    :type auto_reweigh: bool
+    :param documents: optional document id per sentence; sentences sharing
+        an id are resampled together as one sampling unit. Defaults to
+        sentence-level resampling.
+    :type documents: list
+    :param n_resamples: number of bootstrap resamples (ignored when
+        ``sample_indices`` is given)
+    :type n_resamples: int
+    :param confidence_level: confidence level for the percentile interval
+    :type confidence_level: float
+    :param seed: seed for the resampling random number generator
+    :type seed: int | None
+    :param sample_indices: optional precomputed resamples; each resample is
+        a sequence of sampling-unit indices drawn with replacement
+    :type sample_indices: list(list(int)) | None
+    :return: point estimates, confidence interval and per-resample scores
+    :rtype: PairedBootstrapResult
+    """
+    n_sentences = len(list_of_references)
+    assert len(hypotheses_a) == n_sentences == len(hypotheses_b), (
+        "The number of hypotheses and their reference(s) should be the "
+        "same for both systems "
+    )
+    try:
+        weights[0][0]
+    except (TypeError, IndexError):
+        pass  # A single weights tuple, as expected.
+    else:
+        raise ValueError(
+            "paired_bootstrap_bleu() expects a single weights tuple, "
+            "not a list of weight tuples."
+        )
+    if not 0 < confidence_level < 1:
+        raise ValueError("confidence_level must be between 0 and 1 (exclusive).")
+
+    # Group sentence indices into sampling units (documents). By default
+    # each sentence is its own unit, i.e. sentence-level resampling.
+    if documents is None:
+        documents = range(n_sentences)
+    assert len(documents) == n_sentences, (
+        "The number of document ids should match the number of sentences "
+    )
+    units = {}
+    for sent_idx, doc_id in enumerate(documents):
+        units.setdefault(doc_id, []).append(sent_idx)
+    units = list(units.values())
+    n_units = len(units)
+
+    if sample_indices is None:
+        rng = random.Random(seed)
+        sample_indices = [
+            [rng.randrange(n_units) for _ in range(n_units)] for _ in range(n_resamples)
+        ]
+    else:
+        sample_indices = [list(sample) for sample in sample_indices]
+        for sample in sample_indices:
+            for unit_idx in sample:
+                if not 0 <= unit_idx < n_units:
+                    raise ValueError(
+                        f"Sampling index {unit_idx} is out of range for "
+                        f"{n_units} sampling unit(s)."
+                    )
+
+    def corpus_scores(sent_indices):
+        references = [list_of_references[i] for i in sent_indices]
+        hyps_a = [hypotheses_a[i] for i in sent_indices]
+        hyps_b = [hypotheses_b[i] for i in sent_indices]
+        score_a = corpus_bleu(
+            references, hyps_a, weights, smoothing_function, auto_reweigh
+        )
+        score_b = corpus_bleu(
+            references, hyps_b, weights, smoothing_function, auto_reweigh
+        )
+        return score_a, score_b
+
+    # Point estimates on the full corpus.
+    bleu_a, bleu_b = corpus_scores(range(n_sentences))
+
+    # Paired bootstrap: both systems are scored on the same resampled
+    # corpus, recomputing clipped n-gram counts and the brevity penalty
+    # from the resampled sentences every time.
+    scores_a, scores_b, deltas = [], [], []
+    for sample in sample_indices:
+        sent_indices = [sent_idx for unit_idx in sample for sent_idx in units[unit_idx]]
+        try:
+            score_a, score_b = corpus_scores(sent_indices)
+        except (ArithmeticError, ValueError):
+            continue  # Skip degenerate resamples.
+        if not (math.isfinite(score_a) and math.isfinite(score_b)):
+            continue
+        scores_a.append(score_a)
+        scores_b.append(score_b)
+        deltas.append(score_a - score_b)
+
+    n_effective = len(deltas)
+    if n_effective == 0:
+        raise ValueError(
+            "All bootstrap resamples failed to produce a valid BLEU score."
+        )
+
+    alpha = 1.0 - confidence_level
+    ordered_deltas = sorted(deltas)
+    ci_low = _percentile(ordered_deltas, alpha / 2)
+    ci_high = _percentile(ordered_deltas, 1 - alpha / 2)
+
+    return PairedBootstrapResult(
+        bleu_a=bleu_a,
+        bleu_b=bleu_b,
+        delta=bleu_a - bleu_b,
+        ci_low=ci_low,
+        ci_high=ci_high,
+        n_effective=n_effective,
+        scores_a=scores_a,
+        scores_b=scores_b,
+        deltas=deltas,
+    )
 
 
 def modified_precision(references, hypothesis, n):

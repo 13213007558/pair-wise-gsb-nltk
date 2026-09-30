@@ -13,6 +13,7 @@ from nltk.translate.bleu_score import (
     closest_ref_length,
     corpus_bleu,
     modified_precision,
+    paired_bootstrap_bleu,
     sentence_bleu,
 )
 
@@ -416,3 +417,160 @@ class TestBLEUWithMultipleWeights(unittest.TestCase):
         assert bleu_scores[2] == corpus_bleu(
             [[ref1a, ref1b, ref1c], [ref2a]], [hyp1, hyp2], weight_3
         )
+
+
+class TestPairedBootstrapBLEU(unittest.TestCase):
+    """Tests for paired_bootstrap_bleu().
+
+    The corpus consists of two documents of very different lengths:
+    document 0 is a single long sentence, document 1 is made of four
+    short sentences. The first sentence also has two reference
+    translations to cover the multi-reference case.
+    """
+
+    references = [
+        [
+            "the cat sat on the mat and watched the dog run across "
+            "the green field".split(),
+            "a cat sat on a mat and watched a dog run across the "
+            "field".split(),
+        ],
+        ["the cat sleeps".split()],
+        ["a dog barks".split()],
+        ["the bird sings".split()],
+        ["the fish swims".split()],
+    ]
+    hypotheses_a = [
+        "the cat sat on the mat and watched the dog run across "
+        "the green field".split(),
+        "the cat sleeps".split(),
+        "a dog barks".split(),
+        "the bird sings".split(),
+        "the fish swims".split(),
+    ]
+    hypotheses_b = [
+        "the dog ran across the field while the cat sat on the "
+        "soft mat".split(),
+        "the cat sleeps well".split(),
+        "the dog barks".split(),
+        "a bird sings".split(),
+        "the small fish swims".split(),
+    ]
+    documents = [0, 1, 1, 1, 1]
+    units = [[0], [1, 2, 3, 4]]
+
+    def bootstrap(self, **kwargs):
+        return paired_bootstrap_bleu(
+            self.references, self.hypotheses_a, self.hypotheses_b, **kwargs
+        )
+
+    def resample(self, sample, documents):
+        """Expands unit-level sample indices into sentence indices."""
+        if documents is None:
+            return list(sample)
+        return [sent_idx for unit_idx in sample for sent_idx in self.units[unit_idx]]
+
+    def test_point_estimates_match_corpus_bleu(self):
+        result = self.bootstrap(n_resamples=10, seed=7)
+        assert result.bleu_a == corpus_bleu(self.references, self.hypotheses_a)
+        assert result.bleu_b == corpus_bleu(self.references, self.hypotheses_b)
+        assert result.delta == result.bleu_a - result.bleu_b
+        assert result.n_effective == 10
+        assert len(result.deltas) == result.n_effective
+        assert result.ci_low <= result.ci_high
+
+    def test_document_level_vs_sentence_level_sampling(self):
+        """
+        The same unit-level sample must select different corpora depending
+        on whether sentences are grouped into documents: document-level
+        sampling keeps all (four) sentences of the resampled document
+        together, while sentence-level sampling picks single sentences.
+        """
+        sample_indices = [[1, 1]]
+        doc_result = self.bootstrap(
+            documents=self.documents, sample_indices=sample_indices
+        )
+        sent_result = self.bootstrap(sample_indices=sample_indices)
+
+        # Document-level: both draws select the whole 4-sentence document.
+        doc_sent_ids = [1, 2, 3, 4, 1, 2, 3, 4]
+        # Sentence-level: both draws select only sentence 1.
+        sent_sent_ids = [1, 1]
+
+        for result, sent_ids in (
+            (doc_result, doc_sent_ids),
+            (sent_result, sent_sent_ids),
+        ):
+            refs = [self.references[i] for i in sent_ids]
+            expected_a = corpus_bleu(refs, [self.hypotheses_a[i] for i in sent_ids])
+            expected_b = corpus_bleu(refs, [self.hypotheses_b[i] for i in sent_ids])
+            assert result.scores_a == [expected_a]
+            assert result.scores_b == [expected_b]
+            assert result.deltas == [expected_a - expected_b]
+
+        # The two sampling units give different corpora, hence different
+        # score differences.
+        assert doc_result.deltas != sent_result.deltas
+
+    def test_replicate_scores_match_corpus_bleu(self):
+        """
+        Every resample score of a small bootstrap run must equal a direct
+        corpus_bleu() call on the corresponding resampled corpus.
+        """
+        sample_indices = [[0, 1], [1, 1], [0, 0], [1, 0]]
+        for documents in (None, self.documents):
+            result = self.bootstrap(documents=documents, sample_indices=sample_indices)
+            assert result.n_effective == len(sample_indices)
+            for k, sample in enumerate(sample_indices):
+                sent_ids = self.resample(sample, documents)
+                refs = [self.references[i] for i in sent_ids]
+                expected_a = corpus_bleu(refs, [self.hypotheses_a[i] for i in sent_ids])
+                expected_b = corpus_bleu(refs, [self.hypotheses_b[i] for i in sent_ids])
+                assert result.scores_a[k] == expected_a
+                assert result.scores_b[k] == expected_b
+                assert result.deltas[k] == expected_a - expected_b
+
+    def test_seed_reproducibility(self):
+        result1 = self.bootstrap(n_resamples=50, seed=42)
+        result2 = self.bootstrap(n_resamples=50, seed=42)
+        assert result1.deltas == result2.deltas
+        assert result1 == result2
+        result3 = self.bootstrap(n_resamples=50, seed=43)
+        assert result1.deltas != result3.deltas
+
+    def test_smoothing_and_empty_hypothesis(self):
+        """
+        Empty candidates and a specified smoothing function follow the
+        existing corpus_bleu() definitions.
+        """
+        hypotheses_empty = [[]] + self.hypotheses_a[1:]
+        chencherry = SmoothingFunction()
+        result = paired_bootstrap_bleu(
+            self.references,
+            hypotheses_empty,
+            self.hypotheses_b,
+            smoothing_function=chencherry.method1,
+            n_resamples=20,
+            seed=3,
+        )
+        assert result.n_effective == 20
+        assert result.bleu_a == corpus_bleu(
+            self.references,
+            hypotheses_empty,
+            smoothing_function=chencherry.method1,
+        )
+
+    def test_invalid_inputs(self):
+        # A list of weight tuples is not supported.
+        with pytest.raises(ValueError):
+            self.bootstrap(weights=[(0.5, 0.5), (0.25, 0.25, 0.25, 0.25)])
+        # Sampling indices must refer to existing units.
+        with pytest.raises(ValueError):
+            self.bootstrap(sample_indices=[[0, 5]])
+        with pytest.raises(ValueError):
+            self.bootstrap(documents=self.documents, sample_indices=[[2]])
+        # Both systems must have as many hypotheses as there are references.
+        with pytest.raises(AssertionError):
+            paired_bootstrap_bleu(
+                self.references, self.hypotheses_a, self.hypotheses_b[:-1]
+            )
